@@ -1,8 +1,8 @@
-import { Client, GatewayIntentBits } from 'discord.js';
+import { Client, GatewayIntentBits, SlashCommandBuilder } from 'discord.js';
 import { config } from './config.js';
 import { cleanupMediaFiles, extractImageAttachments, saveImageAttachments } from './media.js';
 import { moderatePost, rejectionReasons } from './moderation.js';
-import { enqueuePost, peekPost, readQueue, removePost } from './queue.js';
+import { enqueuePost, peekPost, readQueue, removePost, removePostAtPosition } from './queue.js';
 import { getReportStats, markReported, recordSuccessfulPost } from './stats.js';
 import { closeXBrowser, ensureXBrowserReady, postToX } from './xPoster.js';
 
@@ -17,6 +17,15 @@ const client = new Client({
 let posting = false;
 let nextTimer = null;
 let dailyReportTimer = null;
+
+const queueDeleteCommand = new SlashCommandBuilder()
+  .setName('delete')
+  .setDescription('キュー内の投稿をリスト番号で削除します')
+  .addIntegerOption((option) => option
+    .setName('index')
+    .setDescription('削除するリスト番号')
+    .setMinValue(1)
+    .setRequired(true));
 
 function extractPostText(message) {
   return message.content.trim();
@@ -143,10 +152,17 @@ async function scheduleDailyReport() {
   }, getNextReportDelayMs());
 }
 
+async function registerGuildCommands() {
+  await Promise.all(client.guilds.cache.map((guild) => guild.commands.set([
+    queueDeleteCommand.toJSON()
+  ])));
+}
+
 client.once('ready', async () => {
   const queue = await readQueue();
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Queue length: ${queue.length}`);
+  await registerGuildCommands();
   await ensureXBrowserReady();
   await scheduleNextPost();
   await scheduleDailyReport();
@@ -160,6 +176,36 @@ async function shutdown() {
 
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== 'delete') return;
+
+  const position = interaction.options.getInteger('index', true);
+
+  try {
+    const { item, queueLength } = await removePostAtPosition(position);
+    if (!item) {
+      await interaction.reply({
+        content: `リスト${position}番目の投稿はありません。現在のリスト数は${queueLength}件です`,
+        ephemeral: true
+      });
+      return;
+    }
+
+    await cleanupMediaFiles(item.mediaPaths);
+    await interaction.reply({
+      content: `リスト${position}番目の投稿を削除しました。残り${queueLength}件です`,
+      ephemeral: true
+    });
+  } catch (error) {
+    console.error('Queue delete command failed:', error);
+    await interaction.reply({
+      content: '削除処理に失敗しました。ログを確認してください',
+      ephemeral: true
+    });
+  }
+});
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;

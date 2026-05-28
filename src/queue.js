@@ -57,3 +57,15 @@ export async function removePost(id) {
   const nextQueue = queue.filter((item) => item.id !== id);
   await writeQueue(nextQueue);
 }
+
+export async function removePostAtPosition(position) {
+  const queue = await readQueue();
+  const index = position - 1;
+  if (index < 0 || index >= queue.length) {
+    return { item: null, queueLength: queue.length };
+  }
+
+  const [item] = queue.splice(index, 1);
+  await writeQueue(queue);
+  return { item, queueLength: queue.length };
+}
