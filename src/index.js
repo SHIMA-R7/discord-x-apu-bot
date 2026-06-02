@@ -59,14 +59,31 @@ function extractPostText(message) {
   return message.content.trim();
 }
 
-// 返信元メッセージに #数字 が含まれていればそのポストのURLを返す（両チャンネル共通）
+function extractXUrl(text = '') {
+  const match = text.match(/https?:\/\/(?:x\.com|twitter\.com)\/[^\s)]+/i);
+  return match?.[0] || null;
+}
+
 async function resolveQuoteUrl(message) {
   if (!message.reference?.messageId) return null;
   try {
     const referenced = await message.fetchReference();
-    const match = referenced.content.match(/#(\d+)/);
-    if (!match) return null;
-    return await getPostUrl(Number(match[1]));
+    const contentUrl = extractXUrl(referenced.content);
+    if (contentUrl) return contentUrl;
+
+    for (const embed of referenced.embeds) {
+      const embedUrl = extractXUrl([
+        embed.url,
+        embed.title,
+        embed.description
+      ].filter(Boolean).join('\n'));
+      if (embedUrl) return embedUrl;
+    }
+
+    const postNoMatch = referenced.content.match(/#(\d+)/);
+    if (!postNoMatch) return null;
+
+    return await getPostUrl(Number(postNoMatch[1]));
   } catch (error) {
     console.error('Quote lookup failed:', error);
     return null;
@@ -392,7 +409,7 @@ client.on('messageCreate', async (message) => {
       const quotedUrl = await resolveQuoteUrl(message);
       const finalText = quotedUrl ? `${text}\n\n${quotedUrl}` : text;
 
-      const code = text ? await moderatePost(text) : 0;
+      const code = finalText ? await moderatePost(finalText) : 0;
       if (code === 0) {
         const mediaPaths = await saveImageAttachments(message);
 
