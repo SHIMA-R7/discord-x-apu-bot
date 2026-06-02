@@ -4,7 +4,8 @@ import { cleanupMediaFiles, extractImageAttachments, saveImageAttachments } from
 import { moderatePost, rejectionReasons } from './moderation.js';
 import { enqueuePost, peekPost, readQueue, removePost, removePostAtPosition } from './queue.js';
 import { getReportStats, markReported, recordSuccessfulPost } from './stats.js';
-import { closeXBrowser, ensureXBrowserReady, postToX } from './xPoster.js';
+import { closeXBrowser, ensureXBrowserReady, postToX, likeToX, retweetToX } from './xPoster.js';
+import { savePostLog, getPostUrl } from './postLog.js';
 
 const client = new Client({
   intents: [
@@ -16,6 +17,7 @@ const client = new Client({
 
 let posting = false;
 let nextTimer = null;
+let nextPostTargetTime = Date.now();
 let dailyReportTimer = null;
 
 const queueDeleteCommand = new SlashCommandBuilder()
@@ -27,8 +29,48 @@ const queueDeleteCommand = new SlashCommandBuilder()
     .setMinValue(1)
     .setRequired(true));
 
+const likeCommand = new SlashCommandBuilder()
+  .setName('like')
+  .setDescription('ポストに「いいね」をします')
+  .addIntegerOption((option) => option
+    .setName('post_no')
+    .setDescription('対象の通し番号（#なしの数字）')
+    .setMinValue(1)
+    .setRequired(false))
+  .addStringOption((option) => option
+    .setName('url')
+    .setDescription('XポストのURL（post_no の代わりに直接指定）')
+    .setRequired(false));
+
+const retweetCommand = new SlashCommandBuilder()
+  .setName('retweet')
+  .setDescription('ポストをリポスト（リツイート）します')
+  .addIntegerOption((option) => option
+    .setName('post_no')
+    .setDescription('対象の通し番号（#なしの数字）')
+    .setMinValue(1)
+    .setRequired(false))
+  .addStringOption((option) => option
+    .setName('url')
+    .setDescription('XポストのURL（post_no の代わりに直接指定）')
+    .setRequired(false));
+
 function extractPostText(message) {
   return message.content.trim();
+}
+
+// 返信元メッセージに #数字 が含まれていればそのポストのURLを返す（両チャンネル共通）
+async function resolveQuoteUrl(message) {
+  if (!message.reference?.messageId) return null;
+  try {
+    const referenced = await message.fetchReference();
+    const match = referenced.content.match(/#(\d+)/);
+    if (!match) return null;
+    return await getPostUrl(Number(match[1]));
+  } catch (error) {
+    console.error('Quote lookup failed:', error);
+    return null;
+  }
 }
 
 function nextDelayMs() {
@@ -38,12 +80,17 @@ function nextDelayMs() {
   return Math.max(1, minutes) * 60_000;
 }
 
-function estimateMinutes(position) {
-  return Math.max(0, Math.round(position * config.postIntervalMinutes));
+function estimatePostTime(position) {
+  const baseTime = nextPostTargetTime;
+  const additionalTime = Math.max(0, position - 1) * config.postIntervalMinutes * 60_000;
+  return new Date(baseTime + additionalTime);
 }
 
 async function scheduleNextPost(delay = nextDelayMs()) {
   if (nextTimer) clearTimeout(nextTimer);
+
+  nextPostTargetTime = Date.now() + delay;
+
   nextTimer = setTimeout(runQueueWorker, delay);
 }
 
@@ -57,10 +104,23 @@ async function runQueueWorker() {
   try {
     const item = await peekPost();
     if (item) {
-      await postToX(item.text, item.mediaPaths || []);
+      const url = await postToX(item.text, item.mediaPaths || []);
+
+      if (item.postNo && url) {
+        await savePostLog(item.postNo, url, item.authorId, item.text);
+      }
+
       await recordSuccessfulPost(item.authorId);
+
       await removePost(item.id);
       await cleanupMediaFiles(item.mediaPaths);
+
+      try {
+        await sendPostLog(item, url);
+      } catch (error) {
+        console.error('Post log failed:', error);
+      }
+
       console.log(`Posted queued item ${item.id}`);
     }
   } catch (error) {
@@ -101,6 +161,38 @@ function buildDailyReport({ totalMembers, activeMembers, dailyPosted, totalPoste
     `本日の投稿件数: ${dailyPosted}`,
     `累計投稿件数: ${totalPosted}`
   ].join('\n');
+}
+
+function getLogChannels() {
+  return client.guilds.cache
+    .map((guild) => guild.channels.cache.find((channel) => (
+      channel.name === config.logChannelName && channel.isTextBased()
+    )))
+    .filter(Boolean);
+}
+
+async function sendPostLog(item, url) {
+  const time = new Date().toLocaleString('ja-JP');
+
+  for (const channel of getLogChannels()) {
+    await channel.send(
+`📤 投稿完了
+
+No:#${item.postNo}
+
+投稿者:
+<@${item.authorId}>
+
+投稿日時:
+${time}
+
+URL:
+${url || '取得失敗'}
+
+本文:
+${item.text}`
+    ).catch((err) => console.error(`ログチャンネルへの送信失敗:`, err));
+  }
 }
 
 function getSystemChannels() {
@@ -154,7 +246,9 @@ async function scheduleDailyReport() {
 
 async function registerGuildCommands() {
   await Promise.all(client.guilds.cache.map((guild) => guild.commands.set([
-    queueDeleteCommand.toJSON()
+    queueDeleteCommand.toJSON(),
+    likeCommand.toJSON(),
+    retweetCommand.toJSON()
   ])));
 }
 
@@ -179,31 +273,72 @@ process.once('SIGTERM', shutdown);
 
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName !== 'delete') return;
 
-  const position = interaction.options.getInteger('index', true);
+  // --- delete コマンド ---
+  if (interaction.commandName === 'delete') {
+    const position = interaction.options.getInteger('index', true);
+    try {
+      const { item, queueLength } = await removePostAtPosition(position);
+      if (!item) {
+        await interaction.reply({
+          content: `リスト${position}番目の投稿はありません。現在のリスト数は${queueLength}件です`,
+          ephemeral: true
+        });
+        return;
+      }
 
-  try {
-    const { item, queueLength } = await removePostAtPosition(position);
-    if (!item) {
+      await cleanupMediaFiles(item.mediaPaths);
       await interaction.reply({
-        content: `リスト${position}番目の投稿はありません。現在のリスト数は${queueLength}件です`,
+        content: `リスト${position}番目の投稿を削除しました。残り${queueLength}件です`,
         ephemeral: true
       });
+    } catch (error) {
+      console.error('Queue delete command failed:', error);
+      await interaction.reply({
+        content: '削除処理に失敗しました。ログを確認してください',
+        ephemeral: true
+      });
+    }
+    return;
+  }
+
+  // --- like / retweet コマンド ---
+  if (interaction.commandName === 'like' || interaction.commandName === 'retweet') {
+    await interaction.deferReply({ ephemeral: true });
+
+    const isLike = interaction.commandName === 'like';
+    const postNo = interaction.options.getInteger('post_no');
+    const directUrl = interaction.options.getString('url');
+
+    // post_no と url のどちらも未指定はエラー
+    if (!postNo && !directUrl) {
+      await interaction.editReply('`post_no` か `url` のどちらかを指定してください。');
       return;
     }
 
-    await cleanupMediaFiles(item.mediaPaths);
-    await interaction.reply({
-      content: `リスト${position}番目の投稿を削除しました。残り${queueLength}件です`,
-      ephemeral: true
-    });
-  } catch (error) {
-    console.error('Queue delete command failed:', error);
-    await interaction.reply({
-      content: '削除処理に失敗しました。ログを確認してください',
-      ephemeral: true
-    });
+    try {
+      let url = directUrl;
+
+      if (!url) {
+        url = await getPostUrl(postNo);
+        if (!url) {
+          await interaction.editReply(`通し番号 #${postNo} のポストURLが保存されていません。`);
+          return;
+        }
+      }
+
+      if (isLike) {
+        await likeToX(url);
+        await interaction.editReply(`「いいね」をしました！\n${url}`);
+      } else {
+        await retweetToX(url);
+        await interaction.editReply(`リポストしました！\n${url}`);
+      }
+    } catch (error) {
+      console.error(`${interaction.commandName} command failed:`, error);
+      await interaction.editReply(`${isLike ? 'いいね' : 'リポスト'}処理に失敗しました。ブラウザ側のログを確認してください。`);
+    }
+    return;
   }
 });
 
@@ -215,14 +350,32 @@ client.on('messageCreate', async (message) => {
   const imageAttachments = extractImageAttachments(message);
   if (!text && imageAttachments.length === 0) return;
 
+  // 即時投稿チャンネル
   if (channelName === config.unrestrictedChannelName) {
     let mediaPaths = [];
     try {
       mediaPaths = await saveImageAttachments(message);
+
+      // 返信なら引用URLを末尾に付加
+      const quotedUrl = await resolveQuoteUrl(message);
+      const finalText = quotedUrl ? `${text}\n\n${quotedUrl}` : text;
+
       await message.reply('即時投稿します');
-      await postToX(text, mediaPaths);
+
+      const url = await postToX(finalText, mediaPaths);
       await recordSuccessfulPost(message.author.id);
       await message.reply('投稿しました');
+
+      try {
+        await sendPostLog({
+          postNo: '即時',
+          authorId: message.author.id,
+          text: finalText
+        }, url);
+      } catch (logError) {
+        console.error('Immediate post log failed:', logError);
+      }
+
     } catch (error) {
       console.error('Immediate post failed:', error);
       await message.reply('投稿に失敗しました。ログを確認してください');
@@ -232,13 +385,37 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  // 通常投稿（モデレーション付きキュー）チャンネル
   if (channelName === config.moderatedChannelName) {
     try {
+      // 返信なら引用URLを末尾に付加
+      const quotedUrl = await resolveQuoteUrl(message);
+      const finalText = quotedUrl ? `${text}\n\n${quotedUrl}` : text;
+
       const code = text ? await moderatePost(text) : 0;
       if (code === 0) {
         const mediaPaths = await saveImageAttachments(message);
-        const { position } = await enqueuePost(text, message.author.id, mediaPaths);
-        await message.reply(`リスト${position}番目、約${estimateMinutes(position)}分後に投稿されます`);
+
+        const { position, item } = await enqueuePost(finalText, message.author.id, mediaPaths);
+        const postTime = estimatePostTime(position);
+        await message.reply(`受付 #${item.postNo}\n予定投稿: ${postTime.toLocaleString('ja-JP')}`);
+
+        for (const logChannel of getLogChannels()) {
+          await logChannel.send(
+`📥 投稿受付
+
+No:#${item.postNo}
+
+投稿者:
+<@${message.author.id}>
+
+予定投稿:
+${postTime.toLocaleString('ja-JP')}
+
+本文:
+${finalText}`
+          ).catch((err) => console.error(`受付ログ送信失敗:`, err));
+        }
       } else {
         const reason = rejectionReasons[code] || rejectionReasons[6];
         await message.reply(`${reason}為、本投稿は阻止されました`);

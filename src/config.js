@@ -31,14 +31,38 @@ function integerRangeEnv(name, fallback, min, max) {
 export const config = {
   discordToken: required('DISCORD_TOKEN'),
   geminiApiKey: required('GEMINI_API_KEY'),
-  geminiModel: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite-preview-09-2025',
-  unrestrictedChannelName: process.env.UNRESTRICTED_CHANNEL_NAME || '制限なし投稿',
-  moderatedChannelName: process.env.MODERATED_CHANNEL_NAME || '投稿',
-  systemChannelName: process.env.SYSTEM_CHANNEL_NAME || 'システム',
-  xBrowserChannel: process.env.X_BROWSER_CHANNEL || 'chrome',
-  xProfileDir: process.env.X_PROFILE_DIR || '.x-profile-apu',
-  postIntervalMinutes: numberEnv('POST_INTERVAL_MINUTES', 10),
-  postIntervalJitterMinutes: numberEnv('POST_INTERVAL_JITTER_MINUTES', 1),
-  dailyReportHour: integerRangeEnv('DAILY_REPORT_HOUR', 23, 0, 23),
-  dailyReportMinute: integerRangeEnv('DAILY_REPORT_MINUTE', 59, 0, 59)
+  geminiModel: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+
+  unrestrictedChannelName:
+    process.env.UNRESTRICTED_CHANNEL_NAME || '制限なし投稿',
+
+  moderatedChannelName:
+    process.env.MODERATED_CHANNEL_NAME || '投稿',
+
+  systemChannelName:
+    process.env.SYSTEM_CHANNEL_NAME || 'システム',
+
+  xBrowserChannel:
+    process.env.X_BROWSER_CHANNEL || 'chrome',
+
+  xProfileDir:
+    process.env.X_PROFILE_DIR || '.x-profile-apu',
+
+  xUsername:
+    (process.env.X_USERNAME || '').replace(/^@/, ''),
+
+  logChannelName:
+    process.env.LOG_CHANNEL_NAME || '投稿ログ',
+
+  postIntervalMinutes:
+    numberEnv('POST_INTERVAL_MINUTES', 10),
+
+  postIntervalJitterMinutes:
+    numberEnv('POST_INTERVAL_JITTER_MINUTES', 1),
+
+  dailyReportHour:
+    integerRangeEnv('DAILY_REPORT_HOUR', 23, 0, 23),
+
+  dailyReportMinute:
+    integerRangeEnv('DAILY_REPORT_MINUTE', 59, 0, 59)
 };
