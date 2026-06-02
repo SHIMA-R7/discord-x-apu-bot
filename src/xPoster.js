@@ -50,6 +50,11 @@ export async function closeXBrowser() {
   xPage = null;
 }
 
+// ページ取得を外部（xNotifier）に公開する
+export function getXPageHandle() {
+  return getXPage();
+}
+
 async function doPostToX(text, mediaPaths = []) {
   const page = await getXPage();
 
@@ -101,8 +106,6 @@ async function doPostToX(text, mediaPaths = []) {
     force: true
   });
 
-  // 投稿後は /status/数字 か /home のどちらかに遷移する。
-  // どちらにも遷移しなかった場合のみ 2 回目クリックを試みる。
   const postSuccessPattern = /\/(status\/\d+|home)/;
 
   const navigated = await Promise.race([
@@ -111,7 +114,6 @@ async function doPostToX(text, mediaPaths = []) {
   ]);
 
   if (!navigated) {
-    // 10 秒以内に遷移しなかった場合のみ 2 回目クリックを試みる
     try {
       await postButton.click({ force: true, timeout: 3000 });
     } catch {}
@@ -122,16 +124,13 @@ async function doPostToX(text, mediaPaths = []) {
     ]);
   }
 
-  // /status/数字 に直接遷移した場合はそのまま返す
   const directUrl = page.url();
   if (directUrl.match(/\/status\/\d+/)) {
     return directUrl;
   }
 
-  // /home に飛んだ場合はタイムライン先頭の自分の投稿リンクからURLを取得する
   if (page.url().includes('/home')) {
     try {
-      // タイムラインが描画されるまで待機
       await page.waitForSelector('[data-testid="tweet"]', { timeout: 10000 });
 
       const statusSelector = config.xUsername
@@ -154,7 +153,6 @@ async function doPostToX(text, mediaPaths = []) {
   return null;
 }
 
-// [FIX] like / retweet も xPostChain に繋いでブラウザ競合を防ぐ
 async function doLikeToX(url) {
   const page = await getXPage();
 
@@ -193,6 +191,60 @@ async function doRetweetToX(url) {
   await confirmButton.click({ force: true });
 
   await page.waitForTimeout(2000);
+}
+
+// 指定URLのポストにリプライする
+async function doReplyToX(targetUrl, text) {
+  const page = await getXPage();
+
+  await page.goto(targetUrl, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000
+  });
+
+  if (page.url().includes('/login')) {
+    throw new Error('Xログインが必要です');
+  }
+
+  // ポストが描画されるまで待機
+  await page.waitForSelector('[data-testid="tweet"]', { timeout: 15000 });
+  await page.waitForTimeout(2000);
+
+  // 返信ボタンをクリック（ポスト本体の reply ボタン = 最初の1つ目）
+  const replyButton = page.locator('[data-testid="reply"]').first();
+  await replyButton.waitFor({ timeout: 10000 });
+  await replyButton.click({ force: true });
+
+  // 返信テキストボックスが開くまで待機
+  const replyEditor = page.locator('[data-testid="tweetTextarea_0"]').first();
+  await replyEditor.waitFor({ timeout: 10000 });
+  await page.waitForTimeout(1000);
+
+  await replyEditor.click();
+  await replyEditor.pressSequentially(text);
+  await page.waitForTimeout(1000);
+
+  // 返信投稿ボタン
+  const replyPostButton = page.locator('[data-testid="tweetButton"]').first();
+  await replyPostButton.waitFor({ timeout: 10000 });
+  await replyPostButton.click({ force: true });
+
+  const postSuccessPattern = /\/(status\/\d+|home)/;
+
+  const navigated = await Promise.race([
+    page.waitForURL(postSuccessPattern, { timeout: 10000 }).then(() => true),
+    page.waitForTimeout(10000).then(() => false)
+  ]);
+
+  if (!navigated) {
+    try {
+      await replyPostButton.click({ force: true, timeout: 3000 });
+    } catch {}
+    await page.waitForTimeout(5000);
+  }
+
+  const finalUrl = page.url();
+  return finalUrl.match(/\/status\/\d+/) ? finalUrl : null;
 }
 
 export async function ensureXBrowserReady() {
@@ -240,4 +292,8 @@ export function likeToX(url) {
 
 export function retweetToX(url) {
   return enqueueXAction(() => doRetweetToX(url));
+}
+
+export function replyToX(targetUrl, text) {
+  return enqueueXAction(() => doReplyToX(targetUrl, text));
 }

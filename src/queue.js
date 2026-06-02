@@ -64,11 +64,25 @@ export async function enqueuePost(text, authorId, mediaPaths = [], metadata = {}
     sourceMessageId: metadata.sourceMessageId || null,
     sourceChannelId: metadata.sourceChannelId || null,
     sourceGuildId: metadata.sourceGuildId || null,
+    // 返信元がまだ未投稿のとき、そのDiscordメッセージIDを保持する。
+    // このフィールドが存在する間は投稿をスキップし、URLが確定したら
+    // text に付加してから null にクリアする。
+    pendingQuoteMessageId: metadata.pendingQuoteMessageId || null,
     createdAt: new Date().toISOString()
   };
   queue.push(item);
   await writeQueue(queue);
   return { item, position: queue.length };
+}
+
+// pendingQuoteMessageId を解決済みにして text を更新する
+export async function resolvePendingQuote(id, resolvedText) {
+  const queue = await readQueue();
+  const item = queue.find((q) => q.id === id);
+  if (!item) return;
+  item.text = resolvedText;
+  item.pendingQuoteMessageId = null;
+  await writeQueue(queue);
 }
 
 export async function shiftPost() {

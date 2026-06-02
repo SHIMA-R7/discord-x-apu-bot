@@ -51,8 +51,21 @@ export const config = {
   xUsername:
     (process.env.X_USERNAME || '').replace(/^@/, ''),
 
+  // 受付ログチャンネル（📥）
   logChannelName:
     process.env.LOG_CHANNEL_NAME || '投稿ログ',
+
+  // 完了ログチャンネル（📤）
+  completeLogChannelName:
+    process.env.COMPLETE_LOG_CHANNEL_NAME || '投稿完了ログ',
+
+  // メンション通知チャンネル
+  mentionChannelName:
+    process.env.MENTION_CHANNEL_NAME || 'メンション',
+
+  // メンション巡回間隔（分）
+  mentionIntervalMinutes:
+    numberEnv('MENTION_INTERVAL_MINUTES', 10),
 
   postIntervalMinutes:
     numberEnv('POST_INTERVAL_MINUTES', 10),

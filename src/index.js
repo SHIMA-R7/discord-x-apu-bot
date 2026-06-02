@@ -2,9 +2,10 @@ import { Client, GatewayIntentBits, SlashCommandBuilder } from 'discord.js';
 import { config } from './config.js';
 import { cleanupMediaFiles, extractImageAttachments, saveImageAttachments } from './media.js';
 import { moderatePost, rejectionReasons } from './moderation.js';
-import { enqueuePost, peekPost, readQueue, removePost, removePostAtPosition } from './queue.js';
+import { enqueuePost, peekPost, readQueue, removePost, removePostAtPosition, resolvePendingQuote } from './queue.js';
 import { getReportStats, markReported, recordSuccessfulPost } from './stats.js';
-import { closeXBrowser, ensureXBrowserReady, postToX, likeToX, retweetToX } from './xPoster.js';
+import { closeXBrowser, ensureXBrowserReady, postToX, likeToX, retweetToX, replyToX, getXPageHandle } from './xPoster.js';
+import { startMentionNotifier, stopMentionNotifier } from './xNotifier.js';
 import { savePostLog, getPostUrl, getPostUrlByMessageId } from './postLog.js';
 
 const client = new Client({
@@ -76,42 +77,53 @@ async function fetchReferencedMessage(message) {
     if (!channel?.messages) return null;
     return await channel.messages.fetch(message.reference.messageId);
   } catch (error) {
-    console.error('Quote lookup failed:', error);
+    console.error('fetchReferencedMessage failed:', error);
     return null;
   }
 }
 
+// 返信元メッセージからXポストURLを解決する。
+// 戻り値: { url: string|null, pendingMessageId: string|null }
+//   url が取れた → 即時付加
+//   pendingMessageId が返る → まだ未投稿なので待機が必要
 async function resolveQuoteUrl(message) {
-  if (message.reference?.messageId) {
-    console.log(`Discord reply detected: ${message.id} -> ${message.reference.messageId}`);
-  }
+  if (!message.reference?.messageId) return { url: null, pendingMessageId: null };
+
+  console.log(`Discord reply detected: ${message.id} -> ${message.reference.messageId}`);
 
   const referenced = await fetchReferencedMessage(message);
-  if (!referenced) return null;
+  if (!referenced) return { url: null, pendingMessageId: null };
 
-  const messageUrl = await getPostUrlByMessageId(referenced.id);
-  if (messageUrl) return messageUrl;
+  // ① byMessageId 逆引き（投稿済みなら即ヒット）
+  const byMsgUrl = await getPostUrlByMessageId(referenced.id);
+  if (byMsgUrl) return { url: byMsgUrl, pendingMessageId: null };
 
+  // ② 返信元本文に X の URL が直書きされている
   const contentUrl = extractXUrl(referenced.content);
-  if (contentUrl) return contentUrl;
+  if (contentUrl) return { url: contentUrl, pendingMessageId: null };
 
+  // ③ embed 内の URL
   for (const embed of referenced.embeds) {
-    const embedUrl = extractXUrl([
-      embed.url,
-      embed.title,
-      embed.description
-    ].filter(Boolean).join('\n'));
-    if (embedUrl) return embedUrl;
+    const embedUrl = extractXUrl([embed.url, embed.title, embed.description].filter(Boolean).join('\n'));
+    if (embedUrl) return { url: embedUrl, pendingMessageId: null };
   }
 
+  // ④ #数字 → postLog 逆引き
   const postNoMatch = referenced.content.match(/#(\d+)/);
-  if (!postNoMatch) return null;
-
-  const postUrl = await getPostUrl(Number(postNoMatch[1]));
-  if (!postUrl) {
-    console.warn(`No posted X URL found for referenced post #${postNoMatch[1]}`);
+  if (postNoMatch) {
+    const postUrl = await getPostUrl(Number(postNoMatch[1]));
+    if (postUrl) return { url: postUrl, pendingMessageId: null };
   }
-  return postUrl;
+
+  // ⑤ 返信元がキュー内に存在する → 未投稿なので待機が必要
+  const queue = await readQueue();
+  const queuedItem = queue.find((q) => q.sourceMessageId === referenced.id);
+  if (queuedItem) {
+    console.log(`Referenced message ${referenced.id} is queued as #${queuedItem.postNo}, will wait for URL`);
+    return { url: null, pendingMessageId: referenced.id };
+  }
+
+  return { url: null, pendingMessageId: null };
 }
 
 function nextDelayMs() {
@@ -129,9 +141,7 @@ function estimatePostTime(position) {
 
 async function scheduleNextPost(delay = nextDelayMs()) {
   if (nextTimer) clearTimeout(nextTimer);
-
   nextPostTargetTime = Date.now() + delay;
-
   nextTimer = setTimeout(runQueueWorker, delay);
 }
 
@@ -145,6 +155,24 @@ async function runQueueWorker() {
   try {
     const item = await peekPost();
     if (item) {
+      // pendingQuoteMessageId がある → 返信元の投稿URLを待機中
+      if (item.pendingQuoteMessageId) {
+        const resolvedUrl = await getPostUrlByMessageId(item.pendingQuoteMessageId);
+        if (!resolvedUrl) {
+          // まだ未投稿。スキップして次のスケジュールへ
+          console.log(`Skipping #${item.postNo}: waiting for quote URL of message ${item.pendingQuoteMessageId}`);
+          posting = false;
+          await scheduleNextPost();
+          return;
+        }
+        // URL が確定したので text に付加して pending を解除
+        const updatedText = `${item.text}\n\n${resolvedUrl}`;
+        await resolvePendingQuote(item.id, updatedText);
+        item.text = updatedText;
+        item.pendingQuoteMessageId = null;
+        console.log(`Resolved pending quote for #${item.postNo}: ${resolvedUrl}`);
+      }
+
       const url = await postToX(item.text, item.mediaPaths || []);
 
       if (item.postNo && url) {
@@ -157,11 +185,35 @@ async function runQueueWorker() {
 
       await recordSuccessfulPost(item.authorId);
 
+      // 元のDiscordメッセージに「投稿しました URL」と返信
+      // → ユーザーがその発言に返信したとき resolveQuoteUrl が URL を逆引きできる
+      if (item.sourceMessageId && item.sourceChannelId) {
+        try {
+          const sourceChannel = await client.channels.fetch(item.sourceChannelId);
+          if (sourceChannel?.messages) {
+            const sourceMessage = await sourceChannel.messages.fetch(item.sourceMessageId);
+            const replyText = url ? `投稿しました\n${url}` : '投稿しました（URL取得失敗）';
+            const botReply = await sourceMessage.reply(replyText);
+
+            // Bot返信メッセージIDでも逆引きできるよう byMessageId に追加登録
+            if (url) {
+              await savePostLog(`queued-reply-${botReply.id}`, url, item.authorId, item.text, {
+                sourceMessageId: botReply.id,
+                sourceChannelId: botReply.channelId,
+                sourceGuildId: botReply.guildId
+              });
+            }
+          }
+        } catch (err) {
+          console.error('元メッセージへの返信失敗:', err);
+        }
+      }
+
       await removePost(item.id);
       await cleanupMediaFiles(item.mediaPaths);
 
       try {
-        await sendPostLog(item, url);
+        await sendCompleteLog(item, url);
       } catch (error) {
         console.error('Post log failed:', error);
       }
@@ -208,6 +260,7 @@ function buildDailyReport({ totalMembers, activeMembers, dailyPosted, totalPoste
   ].join('\n');
 }
 
+// 受付ログチャンネル（📥）
 function getLogChannels() {
   return client.guilds.cache
     .map((guild) => guild.channels.cache.find((channel) => (
@@ -216,10 +269,20 @@ function getLogChannels() {
     .filter(Boolean);
 }
 
-async function sendPostLog(item, url) {
+// 完了ログチャンネル（📤）
+function getCompleteLogChannels() {
+  return client.guilds.cache
+    .map((guild) => guild.channels.cache.find((channel) => (
+      channel.name === config.completeLogChannelName && channel.isTextBased()
+    )))
+    .filter(Boolean);
+}
+
+// 📤 投稿完了ログ → #投稿完了ログ へ送信
+async function sendCompleteLog(item, url) {
   const time = new Date().toLocaleString('ja-JP');
 
-  for (const channel of getLogChannels()) {
+  for (const channel of getCompleteLogChannels()) {
     await channel.send(
 `📤 投稿完了
 
@@ -236,7 +299,7 @@ ${url || '取得失敗'}
 
 本文:
 ${item.text}`
-    ).catch((err) => console.error(`ログチャンネルへの送信失敗:`, err));
+    ).catch((err) => console.error(`完了ログチャンネルへの送信失敗:`, err));
   }
 }
 
@@ -305,9 +368,39 @@ client.once('ready', async () => {
   await ensureXBrowserReady();
   await scheduleNextPost();
   await scheduleDailyReport();
+
+  startMentionNotifier({
+    getPage: () => getXPageHandle(),
+    intervalMs: config.mentionIntervalMinutes * 60_000,
+    onNewMention: notifyMention
+  });
 });
 
+// メンションチャンネル取得
+function getMentionChannels() {
+  return client.guilds.cache
+    .map((guild) => guild.channels.cache.find((channel) => (
+      channel.name === config.mentionChannelName && channel.isTextBased()
+    )))
+    .filter(Boolean);
+}
+
+// 新着メンションをDiscordに投稿する
+async function notifyMention(url) {
+  for (const channel of getMentionChannels()) {
+    await channel.send(
+`📣 メンションが届きました
+
+${url}
+
+このメッセージに返信するとXでリプライができます`
+    ).catch((err) => console.error('メンション通知送信失敗:', err));
+  }
+  console.log(`Mention notified: ${url}`);
+}
+
 async function shutdown() {
+  stopMentionNotifier();
   await closeXBrowser();
   client.destroy();
   process.exit(0);
@@ -355,7 +448,6 @@ client.on('interactionCreate', async (interaction) => {
     const postNo = interaction.options.getInteger('post_no');
     const directUrl = interaction.options.getString('url');
 
-    // post_no と url のどちらも未指定はエラー
     if (!postNo && !directUrl) {
       await interaction.editReply('`post_no` か `url` のどちらかを指定してください。');
       return;
@@ -395,17 +487,49 @@ client.on('messageCreate', async (message) => {
   const imageAttachments = extractImageAttachments(message);
   if (!text && imageAttachments.length === 0) return;
 
+  // メンションチャンネル（返信 → Xでリプライ）
+  if (channelName === config.mentionChannelName) {
+    // 返信でない場合は無視
+    if (!message.reference?.messageId) return;
+
+    try {
+      const referenced = await fetchReferencedMessage(message);
+      if (!referenced) {
+        await message.reply('返信元のメッセージが取得できませんでした');
+        return;
+      }
+
+      // 返信元メッセージからXのURLを抽出
+      const targetUrl = extractXUrl(referenced.content);
+      if (!targetUrl) {
+        await message.reply('返信元にXのURLが見つかりませんでした');
+        return;
+      }
+
+      await message.reply('リプライします');
+      const replyUrl = await replyToX(targetUrl, text);
+      await recordSuccessfulPost(message.author.id);
+      await message.reply(replyUrl ? `リプライしました
+${replyUrl}` : 'リプライしました（URL取得失敗）');
+
+    } catch (error) {
+      console.error('Reply to X failed:', error);
+      await message.reply('リプライに失敗しました。ログを確認してください');
+    }
+    return;
+  }
+
   // 即時投稿チャンネル
   if (channelName === config.unrestrictedChannelName) {
     let mediaPaths = [];
     try {
       mediaPaths = await saveImageAttachments(message);
 
-      // 返信なら引用URLを末尾に付加
-      const quotedUrl = await resolveQuoteUrl(message);
+      const { url: quotedUrl } = await resolveQuoteUrl(message);
       const finalText = quotedUrl ? `${text}\n\n${quotedUrl}` : text;
+      const isQuote = !!quotedUrl;
 
-      await message.reply('即時投稿します');
+      await message.reply(isQuote ? '引用RTとして投稿します' : '即時投稿します');
 
       const url = await postToX(finalText, mediaPaths);
       if (url) {
@@ -419,7 +543,7 @@ client.on('messageCreate', async (message) => {
       await message.reply('投稿しました');
 
       try {
-        await sendPostLog({
+        await sendCompleteLog({
           postNo: '即時',
           authorId: message.author.id,
           text: finalText
@@ -440,8 +564,9 @@ client.on('messageCreate', async (message) => {
   // 通常投稿（モデレーション付きキュー）チャンネル
   if (channelName === config.moderatedChannelName) {
     try {
-      // 返信なら引用URLを末尾に付加
-      const quotedUrl = await resolveQuoteUrl(message);
+      const { url: quotedUrl, pendingMessageId } = await resolveQuoteUrl(message);
+
+      // URL が即時解決できた場合は finalText に付加、待機中の場合は pendingQuoteMessageId に保存
       const finalText = quotedUrl ? `${text}\n\n${quotedUrl}` : text;
 
       const code = text ? await moderatePost(text) : 0;
@@ -451,22 +576,35 @@ client.on('messageCreate', async (message) => {
         const { position, item } = await enqueuePost(finalText, message.author.id, mediaPaths, {
           sourceMessageId: message.id,
           sourceChannelId: message.channelId,
-          sourceGuildId: message.guildId
+          sourceGuildId: message.guildId,
+          pendingQuoteMessageId: pendingMessageId  // null なら通常キュー
         });
-        const postTime = estimatePostTime(position);
-        await message.reply(`受付 #${item.postNo}\n予定投稿: ${postTime.toLocaleString('ja-JP')}`);
 
+        const postTime = estimatePostTime(position);
+
+        // 返信の種類によって受付メッセージを変える
+        let replyMsg;
+        if (quotedUrl) {
+          replyMsg = `受付 #${item.postNo}（引用RT）\n予定投稿: ${postTime.toLocaleString('ja-JP')}`;
+        } else if (pendingMessageId) {
+          replyMsg = `受付 #${item.postNo}（返信元の投稿完了後に引用RTとして投稿します）\n予定投稿: ${postTime.toLocaleString('ja-JP')} 以降`;
+        } else {
+          replyMsg = `受付 #${item.postNo}\n予定投稿: ${postTime.toLocaleString('ja-JP')}`;
+        }
+        await message.reply(replyMsg);
+
+        // 📥 受付ログ → #投稿ログ
         for (const logChannel of getLogChannels()) {
           await logChannel.send(
 `📥 投稿受付
 
-No:#${item.postNo}
+No:#${item.postNo}${pendingMessageId ? '（引用RT待機中）' : quotedUrl ? '（引用RT）' : ''}
 
 投稿者:
 <@${message.author.id}>
 
 予定投稿:
-${postTime.toLocaleString('ja-JP')}
+${postTime.toLocaleString('ja-JP')}${pendingMessageId ? ' 以降' : ''}
 
 本文:
 ${finalText}`
