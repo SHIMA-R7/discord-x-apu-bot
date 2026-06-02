@@ -53,7 +53,7 @@ async function nextPostNo() {
   return value;
 }
 
-export async function enqueuePost(text, authorId, mediaPaths = []) {
+export async function enqueuePost(text, authorId, mediaPaths = [], metadata = {}) {
   const queue = await readQueue();
   const item = {
     id: randomUUID(),
@@ -61,6 +61,9 @@ export async function enqueuePost(text, authorId, mediaPaths = []) {
     text,
     mediaPaths,
     authorId,
+    sourceMessageId: metadata.sourceMessageId || null,
+    sourceChannelId: metadata.sourceChannelId || null,
+    sourceGuildId: metadata.sourceGuildId || null,
     createdAt: new Date().toISOString()
   };
   queue.push(item);

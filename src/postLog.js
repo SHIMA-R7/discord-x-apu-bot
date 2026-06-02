@@ -37,15 +37,23 @@ async function writeLog(log) {
 }
 
 // 🌟 authorId と text を追加
-export async function savePostLog(postNo, url, authorId, text) {
+export async function savePostLog(postNo, url, authorId, text, metadata = {}) {
   const log = await readLog();
 
-  log[String(postNo)] = {
+  const entry = {
     url,
     authorId,
     text,
+    ...metadata,
     postedAt: new Date().toISOString()
   };
+
+  log[String(postNo)] = entry;
+
+  if (metadata.sourceMessageId) {
+    log.byMessageId ||= {};
+    log.byMessageId[String(metadata.sourceMessageId)] = entry;
+  }
 
   await writeLog(log);
 }
@@ -54,4 +62,10 @@ export async function getPostUrl(postNo) {
   const log = await readLog();
 
   return log[String(postNo)]?.url || null;
+}
+
+export async function getPostUrlByMessageId(messageId) {
+  const log = await readLog();
+
+  return log.byMessageId?.[String(messageId)]?.url || null;
 }

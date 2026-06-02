@@ -5,7 +5,7 @@ import { moderatePost, rejectionReasons } from './moderation.js';
 import { enqueuePost, peekPost, readQueue, removePost, removePostAtPosition } from './queue.js';
 import { getReportStats, markReported, recordSuccessfulPost } from './stats.js';
 import { closeXBrowser, ensureXBrowserReady, postToX, likeToX, retweetToX } from './xPoster.js';
-import { savePostLog, getPostUrl } from './postLog.js';
+import { savePostLog, getPostUrl, getPostUrlByMessageId } from './postLog.js';
 
 const client = new Client({
   intents: [
@@ -82,8 +82,15 @@ async function fetchReferencedMessage(message) {
 }
 
 async function resolveQuoteUrl(message) {
+  if (message.reference?.messageId) {
+    console.log(`Discord reply detected: ${message.id} -> ${message.reference.messageId}`);
+  }
+
   const referenced = await fetchReferencedMessage(message);
   if (!referenced) return null;
+
+  const messageUrl = await getPostUrlByMessageId(referenced.id);
+  if (messageUrl) return messageUrl;
 
   const contentUrl = extractXUrl(referenced.content);
   if (contentUrl) return contentUrl;
@@ -141,7 +148,11 @@ async function runQueueWorker() {
       const url = await postToX(item.text, item.mediaPaths || []);
 
       if (item.postNo && url) {
-        await savePostLog(item.postNo, url, item.authorId, item.text);
+        await savePostLog(item.postNo, url, item.authorId, item.text, {
+          sourceMessageId: item.sourceMessageId,
+          sourceChannelId: item.sourceChannelId,
+          sourceGuildId: item.sourceGuildId
+        });
       }
 
       await recordSuccessfulPost(item.authorId);
@@ -397,6 +408,13 @@ client.on('messageCreate', async (message) => {
       await message.reply('即時投稿します');
 
       const url = await postToX(finalText, mediaPaths);
+      if (url) {
+        await savePostLog(`immediate-${message.id}`, url, message.author.id, finalText, {
+          sourceMessageId: message.id,
+          sourceChannelId: message.channelId,
+          sourceGuildId: message.guildId
+        });
+      }
       await recordSuccessfulPost(message.author.id);
       await message.reply('投稿しました');
 
@@ -430,7 +448,11 @@ client.on('messageCreate', async (message) => {
       if (code === 0) {
         const mediaPaths = await saveImageAttachments(message);
 
-        const { position, item } = await enqueuePost(finalText, message.author.id, mediaPaths);
+        const { position, item } = await enqueuePost(finalText, message.author.id, mediaPaths, {
+          sourceMessageId: message.id,
+          sourceChannelId: message.channelId,
+          sourceGuildId: message.guildId
+        });
         const postTime = estimatePostTime(position);
         await message.reply(`受付 #${item.postNo}\n予定投稿: ${postTime.toLocaleString('ja-JP')}`);
 
