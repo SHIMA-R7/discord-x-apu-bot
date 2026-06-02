@@ -64,30 +64,47 @@ function extractXUrl(text = '') {
   return match?.[0] || null;
 }
 
-async function resolveQuoteUrl(message) {
+async function fetchReferencedMessage(message) {
   if (!message.reference?.messageId) return null;
+
   try {
-    const referenced = await message.fetchReference();
-    const contentUrl = extractXUrl(referenced.content);
-    if (contentUrl) return contentUrl;
+    return await message.fetchReference();
+  } catch {}
 
-    for (const embed of referenced.embeds) {
-      const embedUrl = extractXUrl([
-        embed.url,
-        embed.title,
-        embed.description
-      ].filter(Boolean).join('\n'));
-      if (embedUrl) return embedUrl;
-    }
-
-    const postNoMatch = referenced.content.match(/#(\d+)/);
-    if (!postNoMatch) return null;
-
-    return await getPostUrl(Number(postNoMatch[1]));
+  try {
+    const channel = await client.channels.fetch(message.reference.channelId);
+    if (!channel?.messages) return null;
+    return await channel.messages.fetch(message.reference.messageId);
   } catch (error) {
     console.error('Quote lookup failed:', error);
     return null;
   }
+}
+
+async function resolveQuoteUrl(message) {
+  const referenced = await fetchReferencedMessage(message);
+  if (!referenced) return null;
+
+  const contentUrl = extractXUrl(referenced.content);
+  if (contentUrl) return contentUrl;
+
+  for (const embed of referenced.embeds) {
+    const embedUrl = extractXUrl([
+      embed.url,
+      embed.title,
+      embed.description
+    ].filter(Boolean).join('\n'));
+    if (embedUrl) return embedUrl;
+  }
+
+  const postNoMatch = referenced.content.match(/#(\d+)/);
+  if (!postNoMatch) return null;
+
+  const postUrl = await getPostUrl(Number(postNoMatch[1]));
+  if (!postUrl) {
+    console.warn(`No posted X URL found for referenced post #${postNoMatch[1]}`);
+  }
+  return postUrl;
 }
 
 function nextDelayMs() {
@@ -409,7 +426,7 @@ client.on('messageCreate', async (message) => {
       const quotedUrl = await resolveQuoteUrl(message);
       const finalText = quotedUrl ? `${text}\n\n${quotedUrl}` : text;
 
-      const code = finalText ? await moderatePost(finalText) : 0;
+      const code = text ? await moderatePost(text) : 0;
       if (code === 0) {
         const mediaPaths = await saveImageAttachments(message);
 
