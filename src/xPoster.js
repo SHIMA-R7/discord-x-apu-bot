@@ -14,15 +14,17 @@ async function clickUntilNavigated(page, buttonLocator, successPattern, maxAttem
       // ボタンが一時的に消えていても続行
     }
 
+    // waitForURL は失敗時に例外を投げるので try/catch で包む
     const navigated = await Promise.race([
-      page.waitForURL(successPattern, { timeout: 8000 }).then(() => true),
+      page.waitForURL(successPattern, { timeout: 8000 })
+        .then(() => true)
+        .catch(() => false),
       page.waitForTimeout(8000).then(() => false)
     ]);
 
     if (navigated) return true;
 
     if (attempt < maxAttempts) {
-      // 次の試行前に少し待機
       await page.waitForTimeout(1500);
     }
   }
@@ -186,13 +188,12 @@ async function doRetweetToX(url) {
   await page.waitForTimeout(3000);
 
   const repostButton = page.locator('[data-testid="retweet"]').first();
-
+  await repostButton.waitFor({ state: 'visible', timeout: 10000 });
   await repostButton.click({ force: true });
 
-  await page.waitForTimeout(1000);
-
+  // ポップアップメニューが出るまで待機してから確認ボタンをクリック
   const confirmButton = page.locator('[data-testid="retweetConfirm"]').first();
-
+  await confirmButton.waitFor({ state: 'visible', timeout: 10000 });
   await confirmButton.click({ force: true });
 
   await page.waitForTimeout(2000);
@@ -220,19 +221,30 @@ async function doReplyToX(targetUrl, text) {
   await replyButton.waitFor({ timeout: 10000 });
   await replyButton.click({ force: true });
 
-  // 返信テキストボックスが開くまで待機
+  // テキストボックスが出現するまで待機
   const replyEditor = page.locator('[data-testid="tweetTextarea_0"]').first();
-  await replyEditor.waitFor({ timeout: 10000 });
-  await page.waitForTimeout(1000);
+  await replyEditor.waitFor({ state: 'visible', timeout: 15000 });
+  await page.waitForTimeout(800);
 
-  await replyEditor.click();
+  await replyEditor.click({ force: true });
+  await page.waitForTimeout(500);
   await replyEditor.pressSequentially(text);
   await page.waitForTimeout(1000);
 
-  // 返信投稿ボタン
-  const replyPostButton = page.locator('[data-testid="tweetButton"]').first();
-  await replyPostButton.waitFor({ timeout: 10000 });
+  // デバッグ用スクリーンショット（テキスト入力後・ボタン探索前）
+  try {
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    const dir = path.resolve('data', 'debug');
+    await fs.mkdir(dir, { recursive: true });
+    await page.screenshot({ path: path.join(dir, `reply-before-button-${Date.now()}.png`), fullPage: false });
+  } catch {}
+
+  // 返信フォームの「返信」ボタンは data-testid="tweetButtonInline"
   const postSuccessPattern = /\/(status\/\d+|home)/;
+
+  const replyPostButton = page.locator('[data-testid="tweetButtonInline"]').first();
+  await replyPostButton.waitFor({ state: 'visible', timeout: 10000 });
   await clickUntilNavigated(page, replyPostButton, postSuccessPattern);
 
   const finalUrl = page.url();
