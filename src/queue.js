@@ -114,3 +114,16 @@ export async function removePostAtPosition(position) {
   await writeQueue(queue);
   return { item, queueLength: queue.length };
 }
+
+// 通し番号（postNo）でキューから削除する
+export async function removePostByNo(postNo) {
+  const queue = await readQueue();
+  const index = queue.findIndex((q) => q.postNo === postNo);
+  if (index === -1) {
+    return { item: null, queueLength: queue.length };
+  }
+
+  const [item] = queue.splice(index, 1);
+  await writeQueue(queue);
+  return { item, queueLength: queue.length };
+}

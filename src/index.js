@@ -2,7 +2,7 @@ import { Client, GatewayIntentBits, SlashCommandBuilder } from 'discord.js';
 import { config } from './config.js';
 import { cleanupMediaFiles, extractImageAttachments, saveImageAttachments } from './media.js';
 import { moderatePost, rejectionReasons } from './moderation.js';
-import { enqueuePost, peekPost, readQueue, removePost, removePostAtPosition, resolvePendingQuote } from './queue.js';
+import { enqueuePost, peekPost, readQueue, removePost, removePostByNo, resolvePendingQuote } from './queue.js';
 import { getReportStats, markReported, recordSuccessfulPost } from './stats.js';
 import { closeXBrowser, ensureXBrowserReady, postToX, likeToX, retweetToX, replyToX, getXPageHandle } from './xPoster.js';
 import { startMentionNotifier, stopMentionNotifier } from './xNotifier.js';
@@ -23,10 +23,10 @@ let dailyReportTimer = null;
 
 const queueDeleteCommand = new SlashCommandBuilder()
   .setName('delete')
-  .setDescription('キュー内の投稿をリスト番号で削除します')
+  .setDescription('キュー内の投稿を通し番号（#の数字）で削除します')
   .addIntegerOption((option) => option
-    .setName('index')
-    .setDescription('削除するリスト番号')
+    .setName('post_no')
+    .setDescription('削除する投稿の通し番号（受付時の #数字）')
     .setMinValue(1)
     .setRequired(true));
 
@@ -147,9 +147,13 @@ async function scheduleNextPost(delay = nextDelayMs()) {
 
 async function runQueueWorker() {
   if (posting) {
-    await scheduleNextPost(30_000);
+    // すでに投稿中なら短いインターバルで再確認するだけ（タイマーはリセットしない）
+    setTimeout(runQueueWorker, 30_000);
     return;
   }
+
+  // 発火した瞬間に次のタイマーをセット → ブラウザ操作時間が間隔に入らない
+  scheduleNextPost();
 
   posting = true;
   try {
@@ -162,7 +166,6 @@ async function runQueueWorker() {
           // まだ未投稿。スキップして次のスケジュールへ
           console.log(`Skipping #${item.postNo}: waiting for quote URL of message ${item.pendingQuoteMessageId}`);
           posting = false;
-          await scheduleNextPost();
           return;
         }
         // URL が確定したので text に付加して pending を解除
@@ -224,7 +227,6 @@ async function runQueueWorker() {
     console.error('Queue worker failed:', error);
   } finally {
     posting = false;
-    await scheduleNextPost();
   }
 }
 
@@ -372,7 +374,9 @@ client.once('ready', async () => {
   startMentionNotifier({
     getPage: () => getXPageHandle(),
     intervalMs: config.mentionIntervalMinutes * 60_000,
-    onNewMention: notifyMention
+    onNewMention: notifyMention,
+    likeToX,
+    retweetToX
   });
 });
 
@@ -414,12 +418,12 @@ client.on('interactionCreate', async (interaction) => {
 
   // --- delete コマンド ---
   if (interaction.commandName === 'delete') {
-    const position = interaction.options.getInteger('index', true);
+    const postNo = interaction.options.getInteger('post_no', true);
     try {
-      const { item, queueLength } = await removePostAtPosition(position);
+      const { item, queueLength } = await removePostByNo(postNo);
       if (!item) {
         await interaction.reply({
-          content: `リスト${position}番目の投稿はありません。現在のリスト数は${queueLength}件です`,
+          content: `#${postNo} はキューに見つかりません。`,
           ephemeral: true
         });
         return;
@@ -427,7 +431,7 @@ client.on('interactionCreate', async (interaction) => {
 
       await cleanupMediaFiles(item.mediaPaths);
       await interaction.reply({
-        content: `リスト${position}番目の投稿を削除しました。残り${queueLength}件です`,
+        content: `#${postNo} を削除しました。残り${queueLength}件です`,
         ephemeral: true
       });
     } catch (error) {
@@ -619,6 +623,41 @@ ${finalText}`
       await message.reply('判定処理に失敗しました。ログを確認してください');
     }
   }
+});
+
+// ---- グローバルエラー通知 ----
+
+// パス・トークンなどの機密情報を伏せる
+function sanitizeError(err) {
+  const msg = (err?.stack || err?.message || String(err));
+  return msg
+    .replace(/[A-Za-z]:\\(?:[^\s'"]+\\)*/g, '<path>\\')   // Windows パス
+    .replace(/\/(?:home|Users|root)\/[^\s'"]+\//g, '<path>/')  // Unix パス
+    .replace(/\/[^\s'"]*\/src\//g, '<path>/src/')
+    .replace(/(token|secret|password|api[_-]?key)\s*[:=]\s*\S+/gi, '$1=***')
+    .slice(0, 1800); // Discord メッセージ上限対策
+}
+
+async function sendErrorToSystem(label, err) {
+  const text = sanitizeError(err);
+  const msg = `🚨 **${label}**
+\`\`\`
+${text}
+\`\`\``;
+  for (const channel of getSystemChannels()) {
+    await channel.send(msg).catch(() => {});
+  }
+}
+
+// 未キャッチの例外・Promise rejection をまとめて拾う
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err);
+  sendErrorToSystem('uncaughtException', err).catch(() => {});
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection:', reason);
+  sendErrorToSystem('unhandledRejection', reason).catch(() => {});
 });
 
 await client.login(config.discordToken);

@@ -5,6 +5,30 @@ let xPostChain = Promise.resolve();
 let xContext = null;
 let xPage = null;
 
+// 投稿・返信ボタンを最大 maxAttempts 回押して URL 遷移を待つ共通ヘルパー
+async function clickUntilNavigated(page, buttonLocator, successPattern, maxAttempts = 5) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await buttonLocator.click({ force: true });
+    } catch {
+      // ボタンが一時的に消えていても続行
+    }
+
+    const navigated = await Promise.race([
+      page.waitForURL(successPattern, { timeout: 8000 }).then(() => true),
+      page.waitForTimeout(8000).then(() => false)
+    ]);
+
+    if (navigated) return true;
+
+    if (attempt < maxAttempts) {
+      // 次の試行前に少し待機
+      await page.waitForTimeout(1500);
+    }
+  }
+  return false;
+}
+
 function buildLaunchOptions() {
   const options = {
     headless: false,
@@ -102,27 +126,8 @@ async function doPostToX(text, mediaPaths = []) {
     timeout: 60000
   });
 
-  await postButton.click({
-    force: true
-  });
-
   const postSuccessPattern = /\/(status\/\d+|home)/;
-
-  const navigated = await Promise.race([
-    page.waitForURL(postSuccessPattern, { timeout: 10000 }).then(() => true),
-    page.waitForTimeout(10000).then(() => false)
-  ]);
-
-  if (!navigated) {
-    try {
-      await postButton.click({ force: true, timeout: 3000 });
-    } catch {}
-
-    await Promise.race([
-      page.waitForURL(postSuccessPattern, { timeout: 10000 }),
-      page.waitForTimeout(10000)
-    ]);
-  }
+  await clickUntilNavigated(page, postButton, postSuccessPattern);
 
   const directUrl = page.url();
   if (directUrl.match(/\/status\/\d+/)) {
@@ -227,21 +232,8 @@ async function doReplyToX(targetUrl, text) {
   // 返信投稿ボタン
   const replyPostButton = page.locator('[data-testid="tweetButton"]').first();
   await replyPostButton.waitFor({ timeout: 10000 });
-  await replyPostButton.click({ force: true });
-
   const postSuccessPattern = /\/(status\/\d+|home)/;
-
-  const navigated = await Promise.race([
-    page.waitForURL(postSuccessPattern, { timeout: 10000 }).then(() => true),
-    page.waitForTimeout(10000).then(() => false)
-  ]);
-
-  if (!navigated) {
-    try {
-      await replyPostButton.click({ force: true, timeout: 3000 });
-    } catch {}
-    await page.waitForTimeout(5000);
-  }
+  await clickUntilNavigated(page, replyPostButton, postSuccessPattern);
 
   const finalUrl = page.url();
   return finalUrl.match(/\/status\/\d+/) ? finalUrl : null;
